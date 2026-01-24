@@ -1,0 +1,11 @@
+making  aN OIDC-Compatible Authentication Microservice 
+
+-system architecture and service boundaries
+-user registration,login,and identity Management
+-JWT issuance,Refresh Tokens, and JWKS 
+-oauth 2.0 AND OIDC flows(Authorization Code,PKCE)
+
+-security hardening , and token validation
+-loging , montitoring , and tracing with openTelemetry 
+
+-Dockerization and Product Deployment 
