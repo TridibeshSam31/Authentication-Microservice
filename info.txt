@@ -1,11 +1,382 @@
-making  aN OIDC-Compatible Authentication Microservice 
+OIDC Authentication — The Complete Protocol Deep-Dive
+=====================================================
 
--system architecture and service boundaries
--user registration,login,and identity Management
--JWT issuance,Refresh Tokens, and JWKS 
--oauth 2.0 AND OIDC flows(Authorization Code,PKCE)
+> This is a comprehensive reference explaining OIDC at the protocol level — every HTTP
+> request, every cryptographic operation, and every security decision needed to build
+> a robust, OIDC-compatible authentication server.
 
--security hardening , and token validation
--loging , montitoring , and tracing with openTelemetry 
 
--Dockerization and Product Deployment 
+PART 1: THE FOUNDATION — WHY OIDC EXISTS
+----------------------------------------
+
+### The Problem OIDC Solves
+
+Before OIDC, every app rolled its own login system. This created three major issues:
+
+  1. Users had to maintain passwords across hundreds of different sites.
+  2. Developers had to repeatedly reinvent (and often break) authentication logic.
+  3. Enterprises had no standardized way to federate identity across distinct services.
+
+OAuth 2.0 solved the authorization problem ("can this app access my photos?") but was
+deliberately silent on identity ("who is this user?"). Apps historically hacked around this by calling
+custom provider-specific APIs (such as `/me` on Facebook or `/userinfo` on Google), but every
+provider was built differently.
+
+OIDC is a standardized identity layer built directly on top of OAuth 2.0. It introduces:
+  - A standard ID Token (JWT) that safely identifies the user.
+  - A standard UserInfo endpoint for retrieving profile data.
+  - A standard Discovery document so clients can auto-configure themselves.
+
+### The Three Actors
+
+Every OIDC flow involves exactly three parties:
+
+  End User (Human)         — Has a browser, owns identity.
+  Relying Party (RP)       — The App/Client, wants to know WHO the user is.
+  OpenID Provider (OP/IdP) — The authentication microservice (this codebase).
+
+The OpenID Provider (OP) is the server designed to authenticate users and issue identity tokens
+to client applications.
+
+
+PART 2: OIDC DISCOVERY — THE STARTING POINT
+--------------------------------------------
+
+Before any authentication flow begins, the client needs to resolve the capabilities of the server. OIDC
+mandates a Discovery Document hosted at a well-known URL.
+
+Request:
+  GET /.well-known/openid-configuration HTTP/1.1
+  Host: auth.domain.com
+
+Response (returned by the authentication microservice):
+  {
+    "issuer": "https://auth.domain.com",
+    "authorization_endpoint": "https://auth.domain.com/auth/authorize",
+    "token_endpoint": "https://auth.domain.com/auth/token",
+    "userinfo_endpoint": "https://auth.domain.com/auth/userinfo",
+    "jwks_uri": "https://auth.domain.com/.well-known/jwks.json",
+    "revocation_endpoint": "https://auth.domain.com/auth/revoke",
+    "response_types_supported": ["code"],
+    "grant_types_supported": ["authorization_code", "refresh_token"],
+    "subject_types_supported": ["public"],
+    "id_token_signing_alg_values_supported": ["RS256"],
+    "scopes_supported": ["openid", "profile", "email", "offline_access"],
+    "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
+    "code_challenge_methods_supported": ["S256"]
+  }
+
+Significance: Any OIDC-compliant client library (such as NextAuth, Passport.js, or Spring Security)
+reads this document once and automatically configures all endpoints, achieving perfect interoperability.
+
+
+PART 3: THE AUTHORIZATION CODE FLOW WITH PKCE — STEP BY STEP
+-------------------------------------------------------------
+
+This is the standard flow implemented for web and mobile apps. The legacy Implicit flow is deprecated.
+Below is the step-by-step process with the corresponding HTTP details.
+
+### Step 0: Client Registration (Pre-requisite)
+
+Before a client application can use the OP, it must be registered in the system:
+
+  OAuthClient table schema:
+    client_id:      "app_3f8a9b2c"
+    client_secret:  "$argon2id$v=19$..." (hashed, confidential clients only)
+    redirect_uris:  ["https://myapp.com/callback"]
+    grant_types:    ["authorization_code", "refresh_token"]
+    client_name:    "My Cool App"
+    client_type:    "public" | "confidential"
+
+  - Confidential clients (backend servers) possess a client_secret.
+  - Public clients (SPAs, mobile apps) have no secret and must use PKCE.
+
+### Step 1: PKCE Setup (Client-Side)
+
+Before redirecting the user, the client generates a cryptographically secure PKCE pair:
+
+  code_verifier  = random_string(43-128 chars, URL-safe)
+                 = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+  code_challenge = BASE64URL( SHA256( code_verifier ) )
+                 = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+Why PKCE? Without it, if an attacker intercepts the authorization code (e.g., via a malicious browser
+extension or open redirect), they can exchange it for tokens. With PKCE, they also need the original
+code_verifier, which never leaves the client application.
+
+### Step 2: Authorization Request (Browser Redirect)
+
+The client redirects the user's browser to the server's authorization endpoint:
+
+  GET /auth/authorize?
+    response_type=code
+    &client_id=app_3f8a9b2c
+    &redirect_uri=https://myapp.com/callback
+    &scope=openid profile email
+    &state=af0ifjsldkj
+    &nonce=n-0S6_WzA2Mj
+    &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+    &code_challenge_method=S256
+
+Parameters:
+  response_type=code    — "I want an authorization code" (forces the secure code flow).
+  client_id             — Identifies which app is asking (looked up in the database).
+  redirect_uri          — Where to redirect the user back (must exactly match registered URIs).
+  scope=openid          — Required for OIDC (triggers ID token issuance).
+  state                 — Random string for CSRF protection.
+  nonce                 — Random string embedded in ID token for replay protection.
+  code_challenge        — SHA256 hash of the PKCE verifier.
+  code_challenge_method — Hash algorithm used (only S256 is acceptable).
+
+What the server does:
+  1. Validate client_id exists in the database.
+  2. Validate redirect_uri matches one of the client's registered URIs exactly.
+  3. Validate response_type is "code".
+  4. Validate scope contains "openid".
+  5. Validate code_challenge_method is "S256".
+  6. Store the code_challenge for later verification during token exchange.
+  7. If user is not logged in → Present login page.
+  8. If user is logged in → Present consent screen.
+
+### Step 3: User Authenticates + Consent
+
+The server presents a login form. Once credentials are submitted, the server:
+  1. Looks up the user by email in PostgreSQL.
+  2. Verifies the password using argon2.verify(hash, password).
+  3. Verifies the TOTP code if MFA is enabled.
+  4. Displays the consent screen showing the requested scopes.
+  5. Processes the user clicking "Allow".
+
+The server then generates an Authorization Code:
+  - code:                opaque, short-lived, one-time-use random string.
+  - clientId:            "app_3f8a9b2c"
+  - userId:              "user_abc123"
+  - redirectUri:         must be re-verified during the token exchange step.
+  - scope:               "openid profile email"
+  - codeChallenge:       stored securely for PKCE verification.
+  - nonce:               stored for inclusion in the ID token.
+  - expiresAt:           10 minutes maximum lifetime.
+  - used:                false
+
+The server redirects the user's browser back:
+  HTTP/1.1 302 Found
+  Location: https://myapp.com/callback?code=SplxlOBeZQQYbYS6WxSbIA&state=af0ifjsldkj
+
+Critical Security Note: The authorization code is exposed in the URL. Therefore, it must be highly
+short-lived and single-use only.
+
+### Step 4: Token Exchange (Back-Channel)
+
+The client's backend server (never the browser) sends the code directly to the token endpoint:
+
+  POST /auth/token HTTP/1.1
+  Content-Type: application/x-www-form-urlencoded
+
+  grant_type=authorization_code
+  &code=SplxlOBeZQQYbYS6WxSbIA
+  &redirect_uri=https://myapp.com/callback
+  &client_id=app_3f8a9b2c
+  &code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+
+For confidential clients, a client_secret is also included via the Authorization Basic header or the body.
+
+The Server Validation Gauntlet:
+   1. Verify grant_type is "authorization_code".
+   2. Look up the authorization code in the database.
+   3. Verify code has not expired (< 10 minutes).
+   4. Verify code has not been used (one-time-use).
+   5. Mark code as used immediately in the database to prevent race conditions/replay attacks.
+   6. Verify client_id matches the code's client_id.
+   7. Verify redirect_uri matches the code's redirect_uri exactly.
+   8. Verify PKCE:
+      - Take the code_verifier from the incoming request.
+      - Compute: SHA256(code_verifier) → base64url encode.
+      - Compare with the stored code_challenge.
+      - If they do not match, reject immediately.
+   9. Verify client_secret if this is a confidential client.
+  10. Issue the final tokens once all checks pass.
+
+Response:
+  {
+    "access_token": "eyJhbGciOiJSUzI1NiIs...",
+    "token_type": "Bearer",
+    "expires_in": 900,
+    "refresh_token": "8xLOxBtZp8",
+    "id_token": "eyJhbGciOiJSUzI1NiIs..."
+  }
+
+
+PART 4: THE THREE TOKENS — ANATOMY & PURPOSE
+---------------------------------------------
+
+### Token 1: Access Token (JWT)
+
+Purpose: Authorizes the client to access protected API endpoints.
+
+  Header: { "alg": "RS256", "typ": "JWT", "kid": "key_202501" }
+  Payload:
+    iss   — The server (issuer).
+    sub   — User's unique internal identifier.
+    aud   — Which client this token is intended for.
+    exp   — Expiration timestamp (typically 15 minutes).
+    iat   — Timestamp when issued.
+    jti   — Unique ID for token tracking/revocation.
+    scope — Granted scopes.
+
+  Signature: RS256(base64url(header) + "." + base64url(payload), PRIVATE_KEY)
+
+Lifetime: 5–15 minutes. Short lifetimes protect against compromise, as access tokens are stateless
+and difficult to revoke on demand.
+
+### Token 2: ID Token (JWT) — The OIDC-Specific One
+
+Purpose: Informs the client application who the authenticated user is. This is the core standardizing
+factor of OIDC over vanilla OAuth 2.0.
+
+  Payload contains standard JWT fields plus:
+    auth_time       — Timestamp when user logged in.
+    nonce           — Must match what the client supplied in Step 2.
+    at_hash         — Cryptographic hash of the access token to bind the two tokens.
+    name, email, etc. — Specific user profile claims granted via scopes.
+
+Key differences from access token:
+  - Contains descriptive user identity claims.
+  - Contains the nonce to prevent replay attacks.
+  - Contains the at_hash to bind it cryptographically to the access token.
+  - Consumed directly by the client (never sent as an authorization header to resource APIs).
+
+### Token 3: Refresh Token (Opaque)
+
+Purpose: Retrieves fresh access/ID tokens once they expire without prompting the user.
+
+  Structure: A secure, opaque, random string rather than a JWT (e.g., "8xLOxBtZp8").
+  Storage: Hashed with argon2id and stored in the database.
+  Contains: userId, family (for rotation tracking), revoked status, and expiresAt (7–30 days).
+
+Why opaque? Refresh tokens must be immediately revocable. Since JWTs are stateless and cannot
+be easily "un-issued", using an opaque database record ensures revocation is instant and reliable.
+
+
+PART 5: REFRESH TOKEN ROTATION — THE SECURITY CRITICAL PART
+------------------------------------------------------------
+
+When the access token expires, the client calls the token endpoint with the refresh token:
+
+  POST /auth/token
+  grant_type=refresh_token&refresh_token=8xLOxBtZp8&client_id=app_3f8a9b2c
+
+The Server Handling Flow:
+  1. Look up refresh token in the database.
+  2. Verify it is not expired.
+  3. Verify it has not been marked as revoked.
+  4. Revoke the current refresh token immediately (making it single-use).
+  5. Issue a new refresh token under the same "family" group.
+  6. Issue a new access token.
+  7. Return both to the client.
+
+Automatic Reuse Detection:
+
+  [Legitimate Client]    uses RT_1  →  Gets RT_2 + new AT  ✓
+  [Attacker stole RT_1]  uses RT_1  →  Server detects RT_1 is already REVOKED
+                                       → ALARM: Token reuse detected!
+                                       → Revoke entire token family (invalidates RT_2)
+                                       → Force user to re-authenticate completely
+
+Server Logic Implementation:
+  Hashed lookups are performed for the token, and family revocation is executed immediately if
+  reuse of a previously revoked token is detected, protecting the user from session hijacking.
+
+
+PART 6: JWKS — HOW EXTERNAL SERVICES VERIFY TOKENS
+---------------------------------------------------
+
+When external resource servers receive an access token, they must verify its signature without
+constantly querying the authorization server (preventing an architectural bottleneck).
+
+### The JWKS Endpoint
+
+  GET /.well-known/jwks.json
+  Exposes the public key set:
+    kty  — Key type ("RSA").
+    use  — Key usage ("sig" for signing).
+    alg  — Signature algorithm ("RS256").
+    kid  — Key ID (matching the JWT header's kid).
+    n    — RSA modulus (public component).
+    e    — RSA exponent (almost always "AQAB" = 65537).
+
+### How Verification Works
+
+  1. Decode the JWT header (unverified) to read the "kid".
+  2. Retrieve the JWKS from /.well-known/jwks.json (cached locally, refreshed on "kid" miss).
+  3. Select the public key matching the decoded "kid".
+  4. Verify the RS256 signature using that public key.
+  5. Validate standard claims: issuer ("iss"), audience ("aud"), expiration ("exp"), etc.
+  6. Accept request as authenticated (identifying the user via the "sub" claim).
+
+### Key Rotation Flow
+
+  Day 1:   Active key = key_202501. JWKS serves: [key_202501].
+  Day 90:  Generate new key = key_202504. JWKS serves: [key_202504, key_202501] (both active).
+           New tokens are signed with key_202504; existing tokens signed with key_202501 still verify.
+  Day 91:  Once all old tokens expire, key_202501 is removed from JWKS.
+
+Why overlap? Removing the old key instantly invalidates all active access tokens. Maintaining an
+overlap ensures continuous uptime while keys are rotated.
+
+
+PART 7: THE USERINFO ENDPOINT
+------------------------------
+
+A protected endpoint returning the profile claims of the authenticated user:
+
+  GET /auth/userinfo
+  Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+
+  Response:
+    { "sub": "user_abc123", "name": "...", "email": "...", "email_verified": true }
+
+Why this exists despite ID Token claims:
+  1. ID tokens are static snapshots and can become outdated.
+  2. The UserInfo endpoint provides a real-time lookup directly from the database.
+
+
+PART 8: SECURITY INVARIANTS — ABSOLUTE PROTOCOL RULES
+------------------------------------------------------
+
+  Rule                                              | Core Security Reason
+  --------------------------------------------------|---------------------------------------------
+  Authorization codes are one-time-use              | Prevents code replay attacks.
+  Authorization codes expire in ≤ 10 minutes        | Dramatically reduces compromise window.
+  redirect_uri must exactly match registered URI    | Defends against open-redirect attacks.
+  PKCE S256 is mandatory for public clients         | Defends against code interception.
+  Access tokens live ≤ 15 minutes                   | Limits exposure window of stateless tokens.
+  Refresh tokens are rotated on every single use    | Enables instant reuse detection.
+  state parameter is verified on callback           | Prevents CSRF.
+  nonce is embedded in ID token and verified        | Prevents ID token replay.
+  JWKS serves only public keys                      | Prevents complete signature compromise.
+  Passwords hashed with argon2id                    | Highly resistant to GPU/ASIC cracking.
+
+
+PART 9: BEYOND THE BASICS — PRODUCTION DESIGN
+---------------------------------------------
+
+Building a complete OIDC provider requires implementing the server-side specifications, rather than
+just consuming libraries. The architecture handles:
+
+  1. Multiple concurrent clients — managing individual redirect URIs, grants, and scopes.
+  2. Key rotation — generating RSA pairs, publishing multi-key JWKS, and safe deprecation.
+  3. Token family tracking — tying refresh tokens together to discover session compromises.
+  4. Clock skew tolerance — validating expiration and issue times with a ±5-second buffer.
+  5. Constant-time comparisons — preventing cryptographic timing attacks during code/token verification.
+  6. OIDC Discovery — dynamically self-describing capabilities.
+  7. Consent management — remembering previously authorized scope permissions per user.
+  8. Audit logs — logging auth events with correlation IDs for tracking and troubleshooting.
+
+Standard Specifications Implemented:
+  - RFC 6749  — OAuth 2.0 Framework
+  - RFC 7636  — PKCE
+  - RFC 7517  — JSON Web Key (JWK)
+  - RFC 7519  — JSON Web Token (JWT)
+  - OpenID Connect Core 1.0
+  - OpenID Connect Discovery 1.0
