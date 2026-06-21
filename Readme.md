@@ -322,4 +322,12 @@ External services verify tokens **without calling the auth server** — they fet
 
 ## License
 
-MIT
+Copyright © 2026 Tridibesh Samantroy. All Rights Reserved.
+
+This project and all of its source code, documentation, diagrams, and assets are the exclusive intellectual property of Tridibesh Samantroy.
+
+Unauthorized copying, reproduction, redistribution, modification, or commercial use of this project — in whole or in part — is strictly prohibited without prior written permission from the author.
+
+This repository is made publicly visible for portfolio and demonstration purposes only. Viewing the code does not grant any license to use, copy, fork, or distribute it.
+
+For licensing inquiries, please contact the author directly.
